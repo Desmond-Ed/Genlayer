@@ -106,7 +106,6 @@ Respond in JSON format:
     "evidence": ["proof1", "proof2"]
 }}
 """
-        
         result = await gl.exec_prompt(prompt)
         
         try:
