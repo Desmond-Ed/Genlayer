@@ -1,149 +1,111 @@
-# { "Depends": "py-genlayer:test" }
+# v0.1.0
+# { "Depends": "py-genlayer:latest" }
 
 from genlayer import *
 import json
-import typing
 
-@gl.contract
-class SocialProofIdentificationLibrary:
-    """
-    Reusable verification library that other contracts can call.
-    Provides identity verification as a service.
-    """
-    
-    verified_users: TreeMap[gl.Address, dict]
-    
+
+class SocialProofLibrary(gl.Contract):
+
+    verified_users: TreeMap[gl.Address, str]
     supported_platforms: DynArray[str]
-    
-    registered_contracts: DynArray[gl.Address]
-    
+    whitelisted_domains: DynArray[str]
+
     def __init__(self):
         self.supported_platforms = ["github", "twitter", "linkedin"]
-    
-    @gl.public.view
-    def is_verified(
-        self, 
-        user_address: str, 
-        min_confidence: int = 70
-    ) -> bool:
-        """
-        Quick check if a user is verified.
-        Other contracts call this to gate access.
-        """
-        address = gl.Address(user_address)
-        if address not in self.verified_users:
-            return False
-        
-        user_data = self.verified_users[address]
-        return (
-            user_data.get("verified", False) and 
-            user_data.get("confidence", 0) >= min_confidence
-        )
-    
-    @gl.public.view
-    def get_verification_data(self, user_address: str) -> TreeMap[str, typing.Any]:
-        """
-        Get full verification details.
-        Returns: platform, verified status, confidence, evidence, timestamp
-        """
-        address = gl.Address(user_address)
-        if address in self.verified_users:
-            return self.verified_users[address]
-        else:
-            return {
-                "verified": False,
-                "message": "No verification found"
-            }
-    
-    @gl.public.view
-    def get_supported_platforms(self) -> DynArray[str]:
-        """
-        Returns list of supported platforms.
-        """
-        return self.supported_platforms
-    
-    
+        self.whitelisted_domains = ["github.com", "twitter.com", "linkedin.com"]
+        self.verified_users = {}
+
+    # --- internal helpers ---
+
+    def _is_domain_whitelisted(self, url: str) -> bool:
+        for domain in self.whitelisted_domains:
+            if domain in url:
+                return True
+        return False
+
+    # --- core verification ---
+
     @gl.public.write
-    async def verify_social_proof(
+    async def verify_user(
         self,
+        user_address: gl.Address,
         platform: str,
         profile_url: str,
-        claim_to_verify: str
-    ) -> TreeMap[str, typing.Any]:
-        """
-        Main verification function.
-        Fetches profile, analyzes with LLM, stores result.
-        """
+        claim: str
+    ) -> str:
+
         if platform not in self.supported_platforms:
-            return {
-                "verified": False,
-                "error": f"Platform {platform} not supported"
-            }
-        
-        try:
-            profile_content = await gl.get_webpage(profile_url, mode='text')
-        except Exception as e:
-            return {
-                "verified": False,
-                "error": f"Failed to fetch profile: {str(e)}"
-            }
-        
+            raise gl.Rollback(f"Platform {platform} not supported")
+
+        if not self._is_domain_whitelisted(profile_url):
+            raise gl.Rollback("Domain not whitelisted")
+
+        # Non deterministic web fetch
+        profile_content = await gl.nondet.web.render(profile_url, mode="text")
+
         prompt = f"""
-Analyze this {platform} profile to verify a claim.
+Determine whether the following claim is supported by the provided profile content.
 
-PROFILE URL: {profile_url}
-PROFILE CONTENT: {profile_content[:3000]}
+Claim:
+"{claim}"
 
-CLAIM: "{claim_to_verify}"
+Profile content:
+{profile_content[:2000]}
 
-Determine if this claim is supported by the profile evidence.
-
-Respond in JSON format:
+Return strict JSON only:
 {{
-    "verified": true/false,
-    "confidence": 0-100,
-    "reasoning": "brief explanation",
-    "evidence": ["proof1", "proof2"]
+  "verified": true or false,
+  "confidence": 0-100
 }}
 """
-        result = await gl.exec_prompt(prompt)
-        
-        try:
-            verification_data = json.loads(result)
-        except:
-            verification_data = {
-                "verified": False,
-                "confidence": 0,
-                "reasoning": "Failed to parse verification",
-                "evidence": []
-            }
-        
-        self.verified_users[gl.message.sender_address] = {
+
+        result = await gl.nondet.exec_prompt(
+            prompt,
+            eq_principle=gl.eq_principle.prompt_non_comparative(
+                criteria="The output must logically assess whether the claim is supported by the profile content."
+            )
+        )
+
+        verification = json.loads(result)
+
+        record = {
             "platform": platform,
-            "profile_url": profile_url,
-            "claim": claim_to_verify,
-            "verified": verification_data.get("verified", False),
-            "confidence": verification_data.get("confidence", 0),
-            "reasoning": verification_data.get("reasoning", ""),
-            "evidence": verification_data.get("evidence", []),
+            "verified": verification["verified"],
+            "confidence": verification["confidence"],
             "timestamp": gl.block.number
         }
-        
-        return verification_data
-    
-    
+
+        users = self.verified_users
+        users[user_address] = json.dumps(record)
+        self.verified_users = users
+
+        return json.dumps(record)
+
+    # --- public read interface ---
+
+    @gl.public.view
+    def is_verified(self, user_address: gl.Address, min_confidence: int = 70) -> bool:
+        if user_address not in self.verified_users:
+            return False
+
+        data = json.loads(self.verified_users[user_address])
+        return data["verified"] and data["confidence"] >= min_confidence
+
+    @gl.public.view
+    def get_verification_data(self, user_address: gl.Address) -> str:
+        return self.verified_users.get(user_address, "")
+
+    # --- admin controls ---
+
     @gl.public.write
     def add_platform(self, platform: str) -> None:
-        """
-        Extend supported platforms.
-        """
-        if platform not in self.supported_platforms:
-            self.supported_platforms.append(platform)
-    
+        platforms = self.supported_platforms
+        platforms.append(platform)
+        self.supported_platforms = platforms
+
     @gl.public.write
-    def register_client_contract(self) -> None:
-        """
-        Allow other contracts to register as clients for tracking.
-        """
-        if gl.message.sender_address not in self.registered_contracts:
-            self.registered_contracts.append(gl.message.sender_address)
+    def add_whitelisted_domain(self, domain: str) -> None:
+        domains = self.whitelisted_domains
+        domains.append(domain)
+        self.whitelisted_domains = domains
