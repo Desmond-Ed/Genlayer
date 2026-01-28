@@ -9,22 +9,10 @@ class SocialProofLibrary(gl.Contract):
 
     verified_users: TreeMap[gl.Address, str]
     supported_platforms: DynArray[str]
-    whitelisted_domains: DynArray[str]
 
     def __init__(self):
         self.supported_platforms = ["github", "twitter", "linkedin"]
-        self.whitelisted_domains = ["github.com", "twitter.com", "linkedin.com"]
-        self.verified_users = {}
-
-    # --- internal helpers ---
-
-    def _is_domain_whitelisted(self, url: str) -> bool:
-        for domain in self.whitelisted_domains:
-            if domain in url:
-                return True
-        return False
-
-    # --- core verification ---
+        self.verified_users = TreeMap[gl.Address, str]()
 
     @gl.public.write
     async def verify_user(
@@ -38,36 +26,28 @@ class SocialProofLibrary(gl.Contract):
         if platform not in self.supported_platforms:
             raise gl.Rollback(f"Platform {platform} not supported")
 
-        if not self._is_domain_whitelisted(profile_url):
-            raise gl.Rollback("Domain not whitelisted")
-
-        # Non deterministic web fetch
         profile_content = await gl.nondet.web.render(profile_url, mode="text")
 
         prompt = f"""
-Determine whether the following claim is supported by the provided profile content.
+Verify this claim: "{claim}"
 
-Claim:
-"{claim}"
-
-Profile content:
+Based on the following {platform} profile content:
 {profile_content[:2000]}
 
 Return strict JSON only:
 {{
   "verified": true or false,
-  "confidence": 0-100
+  "confidence": 0-100,
+  "evidence": ["proof1", "proof2"]
 }}
 """
 
-        result = await gl.nondet.exec_prompt(
-            prompt,
-            eq_principle=gl.eq_principle.prompt_non_comparative(
-                criteria="The output must logically assess whether the claim is supported by the profile content."
-            )
-        )
-
-        verification = json.loads(result)
+        result = await gl.nondet.exec_prompt(prompt)
+        
+        try:
+            verification = json.loads(result)
+        except json.JSONDecodeError:
+            raise gl.Rollback(f"Failed to parse verification result: {result[:100]}")
 
         record = {
             "platform": platform,
@@ -76,13 +56,9 @@ Return strict JSON only:
             "timestamp": gl.block.number
         }
 
-        users = self.verified_users
-        users[user_address] = json.dumps(record)
-        self.verified_users = users
+        self.verified_users[user_address] = json.dumps(record)
 
         return json.dumps(record)
-
-    # --- public read interface ---
 
     @gl.public.view
     def is_verified(self, user_address: gl.Address, min_confidence: int = 70) -> bool:
@@ -96,16 +72,10 @@ Return strict JSON only:
     def get_verification_data(self, user_address: gl.Address) -> str:
         return self.verified_users.get(user_address, "")
 
-    # --- admin controls ---
-
     @gl.public.write
     def add_platform(self, platform: str) -> None:
-        platforms = self.supported_platforms
-        platforms.append(platform)
-        self.supported_platforms = platforms
+        if platform not in self.supported_platforms:
+            self.supported_platforms.append(platform)
 
-    @gl.public.write
-    def add_whitelisted_domain(self, domain: str) -> None:
-        domains = self.whitelisted_domains
-        domains.append(domain)
-        self.whitelisted_domains = domains
+def main() -> SocialProofLibrary:
+    return SocialProofLibrary()
